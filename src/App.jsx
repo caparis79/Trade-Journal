@@ -32,7 +32,15 @@ import { getFirestore, doc, setDoc, collection, onSnapshot, deleteDoc, writeBatc
 
 // --- Firebase Configuration & Initialization ---
 const appId = typeof __app_id !== 'undefined' ? __app_id : 'trade-log-app';
-const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+const firebaseConfig = {
+  apiKey: "AIzaSyDcPRcWFZ6NCsH_OtZrPnhRP6MhqhaQt68",
+  authDomain: "trade-journal-f2aed.firebaseapp.com",
+  projectId: "trade-journal-f2aed",
+  storageBucket: "trade-journal-f2aed.firebasestorage.app",
+  messagingSenderId: "319958856265",
+  appId: "1:319958856265:web:17e640c8d45bb3e217c598",
+  measurementId: "G-3Y064SQ29G"
+};
 
 let app, auth, db;
 if (firebaseConfig) {
