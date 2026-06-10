@@ -32,15 +32,7 @@ import { getFirestore, doc, setDoc, collection, onSnapshot, deleteDoc, writeBatc
 
 // --- Firebase Configuration & Initialization ---
 const appId = typeof __app_id !== 'undefined' ? __app_id : 'trade-log-app';
-const firebaseConfig = {
-  apiKey: "AIzaSyDcPRcWFZ6NCsH_OtZrPnhRP6MhqhaQt68",
-  authDomain: "trade-journal-f2aed.firebaseapp.com",
-  projectId: "trade-journal-f2aed",
-  storageBucket: "trade-journal-f2aed.firebasestorage.app",
-  messagingSenderId: "319958856265",
-  appId: "1:319958856265:web:17e640c8d45bb3e217c598",
-  measurementId: "G-3Y064SQ29G"
-};
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
 
 let app, auth, db;
 if (firebaseConfig) {
@@ -158,7 +150,6 @@ export default function App() {
     if (!db || !user) return;
     setIsSyncing(true);
     
-    // Strict Path Pattern: /artifacts/{appId}/users/{userId}/trades
     const tradesCol = collection(db, 'artifacts', appId, 'users', user.uid, 'trades');
     
     const unsubscribe = onSnapshot(tradesCol, (snapshot) => {
@@ -273,7 +264,7 @@ export default function App() {
 
   // --- CSV Parser & Mapper Logic ---
   const startCsvMapping = () => {
-    if (!csvText.trim()) {
+    if (!csvText || !csvText.trim()) {
       showToast("Please paste CSV data first.", "error");
       return;
     }
@@ -286,8 +277,8 @@ export default function App() {
     const headers = lines[0].split(',').map(h => h.trim().replace(/^["']|["']$/g, ''));
     const previewRows = lines.slice(1, 4).map(line => line.split(',').map(v => v.trim().replace(/^["']|["']$/g, '')));
 
-    setCsvPreviewHeaders(headers);
-    setCsvPreviewRows(previewRows);
+    setCsvPreviewHeaders(headers || []);
+    setCsvPreviewRows(previewRows || []);
 
     // Dynamic Autodetect Mapping Rules
     const detected = { dateOpen: '', dateClose: '', ticker: '', type: '', side: '', pnl: '' };
@@ -358,7 +349,7 @@ export default function App() {
 
   // --- Dynamic Filters Processing ---
   const processedTrades = useMemo(() => {
-    return trades.filter(t => {
+    return (trades || []).filter(t => {
       // 1. Ticker filter
       if (selectedTicker !== 'All' && t.ticker !== selectedTicker) return false;
       
@@ -409,18 +400,18 @@ export default function App() {
 
   // --- Unique Filters list generation ---
   const tickerOptions = useMemo(() => {
-    const list = new Set(trades.map(t => t.ticker));
+    const list = new Set((trades || []).map(t => t.ticker));
     return ['All', ...Array.from(list).sort()];
   }, [trades]);
 
   const typeOptions = useMemo(() => {
-    const list = new Set(trades.map(t => t.type));
+    const list = new Set((trades || []).map(t => t.type));
     return ['All', ...Array.from(list).sort()];
   }, [trades]);
 
   // --- Statistics Calculations ---
   const metrics = useMemo(() => {
-    if (processedTrades.length === 0) {
+    if (!processedTrades || processedTrades.length === 0) {
       return { totalPnl: 0, winRate: 0, profitFactor: 0, totalTrades: 0, winningTrades: 0, losingTrades: 0, avgWin: 0, avgLoss: 0 };
     }
 
@@ -452,7 +443,7 @@ export default function App() {
   // Tickers breakdown table metrics
   const tickerStats = useMemo(() => {
     const data = {};
-    processedTrades.forEach(t => {
+    (processedTrades || []).forEach(t => {
       if (!data[t.ticker]) data[t.ticker] = { pnl: 0, count: 0, wins: 0 };
       data[t.ticker].pnl += parseFloat(t.pnl) || 0;
       data[t.ticker].count += 1;
@@ -468,9 +459,9 @@ export default function App() {
       .sort((a, b) => b.pnl - a.pnl);
   }, [processedTrades]);
 
-  // --- Chart Processing logic (Cumulative Equity & P/L Distribution) ---
+  // --- Chart Processing logic ---
   const equityCurvePoints = useMemo(() => {
-    const sorted = [...processedTrades].sort((a, b) => new Date(a.dateClose) - new Date(b.dateClose));
+    const sorted = [...(processedTrades || [])].sort((a, b) => new Date(a.dateClose) - new Date(b.dateClose));
     let runningSum = 0;
     return sorted.map((t, idx) => {
       runningSum += parseFloat(t.pnl);
@@ -484,9 +475,8 @@ export default function App() {
 
   // --- Views ---
   const renderDashboard = () => {
-    // Generate beautiful interactive SVG for Equity Curve
     const buildEquityCurve = () => {
-      if (equityCurvePoints.length < 2) {
+      if (!equityCurvePoints || equityCurvePoints.length < 2) {
         return (
           <div className="h-64 flex flex-col items-center justify-center text-slate-400 bg-slate-50 rounded-xl border border-dashed border-slate-200">
             <Activity className="h-10 w-10 mb-2 text-slate-300" />
@@ -508,7 +498,6 @@ export default function App() {
       const getX = (index) => padding + (index / (equityCurvePoints.length - 1)) * (width - 2 * padding);
       const getY = (val) => height - padding - ((val - minPnl) / pnlRange) * (height - 2 * padding);
 
-      // SVG path construction
       let linePath = `M ${getX(0)} ${getY(equityCurvePoints[0].pnl)}`;
       for (let i = 1; i < equityCurvePoints.length; i++) {
         linePath += ` L ${getX(i)} ${getY(equityCurvePoints[i].pnl)}`;
@@ -519,17 +508,12 @@ export default function App() {
       return (
         <div className="w-full">
           <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-auto overflow-visible select-none">
-            {/* Grid Line Marks */}
             <line x1={padding} y1={zeroY} x2={width - padding} y2={zeroY} stroke="#cbd5e1" strokeDasharray="3" strokeWidth="1.5" />
-            
-            {/* Smooth Equity Line Area Gradient */}
             <path
               d={`${linePath} L ${getX(equityCurvePoints.length - 1)} ${height - padding} L ${getX(0)} ${height - padding} Z`}
               fill="url(#equityGradient)"
               opacity="0.12"
             />
-
-            {/* Line Path */}
             <path
               d={linePath}
               fill="none"
@@ -538,8 +522,6 @@ export default function App() {
               strokeLinecap="round"
               strokeLinejoin="round"
             />
-
-            {/* Points circles */}
             {equityCurvePoints.map((point, idx) => (
               <circle
                 key={idx}
@@ -552,8 +534,6 @@ export default function App() {
                 className="cursor-pointer transition hover:scale-150"
               />
             ))}
-
-            {/* Definitions for Gradient */}
             <defs>
               <linearGradient id="equityGradient" x1="0" y1="0" x2="0" y2="1">
                 <stop offset="0%" stopColor="#0ea5e9" />
@@ -576,7 +556,7 @@ export default function App() {
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
           <div className="bg-white p-6 rounded-xl border border-slate-200 shadow-sm flex items-center space-x-4">
             <div className={`p-3 rounded-full ${metrics.totalPnl >= 0 ? 'bg-emerald-100 text-emerald-600' : 'bg-rose-100 text-rose-600'}`}>
-              <DollarSign size={24} />
+              <DollarSign className="h-6 w-6" />
             </div>
             <div>
               <p className="text-sm text-slate-500 font-medium">Net P/L</p>
@@ -588,7 +568,7 @@ export default function App() {
 
           <div className="bg-white p-6 rounded-xl border border-slate-200 shadow-sm flex items-center space-x-4">
             <div className="p-3 rounded-full bg-blue-100 text-blue-600">
-              <Target size={24} />
+              <Target className="h-6 w-6" />
             </div>
             <div>
               <p className="text-sm text-slate-500 font-medium">Win Rate</p>
@@ -598,7 +578,7 @@ export default function App() {
 
           <div className="bg-white p-6 rounded-xl border border-slate-200 shadow-sm flex items-center space-x-4">
             <div className="p-3 rounded-full bg-purple-100 text-purple-600">
-              <TrendingUp size={24} />
+              <TrendingUp className="h-6 w-6" />
             </div>
             <div>
               <p className="text-sm text-slate-500 font-medium">Profit Factor</p>
@@ -608,7 +588,7 @@ export default function App() {
 
           <div className="bg-white p-6 rounded-xl border border-slate-200 shadow-sm flex items-center space-x-4">
             <div className="p-3 rounded-full bg-orange-100 text-orange-600">
-              <Activity size={24} />
+              <Activity className="h-6 w-6" />
             </div>
             <div>
               <p className="text-sm text-slate-500 font-medium">Average Win / Loss</p>
@@ -623,7 +603,6 @@ export default function App() {
 
         {/* Charts and Visual Analytics */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          {/* Equity Chart */}
           <div className="bg-white lg:col-span-2 rounded-xl border border-slate-200 shadow-sm overflow-hidden flex flex-col justify-between">
             <div className="p-5 border-b border-slate-100 bg-slate-50 flex justify-between items-center">
               <h2 className="text-sm font-semibold text-slate-800 uppercase tracking-wider flex items-center">
@@ -636,7 +615,6 @@ export default function App() {
             </div>
           </div>
 
-          {/* Quick Metrics Breakdown */}
           <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden flex flex-col justify-between">
             <div className="p-5 border-b border-slate-100 bg-slate-50">
               <h2 className="text-sm font-semibold text-slate-800 uppercase tracking-wider flex items-center">
@@ -718,17 +696,14 @@ export default function App() {
 
   const renderCalendar = () => {
     const daysInMonth = new Date(calendarYear, calendarMonth + 1, 0).getDate();
-    const firstDay = new Date(calendarYear, calendarMonth, 1).getDay(); // 0 = Sunday
-    
-    // Month Names Helper
+    const firstDay = new Date(calendarYear, calendarMonth, 1).getDay();
     const monthNames = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
 
-    // Dynamic Filtered trade lists for calendar aggregation
     const monthlyPnl = {};
-    trades.forEach(t => {
+    (trades || []).forEach(t => {
       const parts = t.dateClose.split('-');
       const y = parseInt(parts[0], 10);
-      const m = parseInt(parts[1], 10) - 1; // Convert to 0-indexed month
+      const m = parseInt(parts[1], 10) - 1;
       const d = parseInt(parts[2], 10);
       
       if (y === calendarYear && m === calendarMonth) {
@@ -755,11 +730,9 @@ export default function App() {
     };
 
     const calendarCells = [];
-    // Prefix padding
     for (let i = 0; i < firstDay; i++) {
       calendarCells.push(<div key={`empty-${i}`} className="p-4 bg-slate-50/40 border border-slate-100 min-h-[90px]"></div>);
     }
-    // Render dynamic cells
     for (let i = 1; i <= daysInMonth; i++) {
       const pnl = monthlyPnl[i];
       let bgClass = "bg-white hover:bg-slate-50/50";
@@ -880,7 +853,6 @@ export default function App() {
 
   const renderImport = () => (
     <div className="space-y-6">
-      {/* CSV Paste Textbox */}
       {!isMappingMode ? (
         <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-6 space-y-4">
           <div>
@@ -893,7 +865,7 @@ export default function App() {
           <div className="space-y-3">
             <textarea 
               className="w-full h-44 p-4 border border-slate-200 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 text-xs font-mono bg-slate-50/50"
-              placeholder={`Date_Closed,Symbol,Action,Amount,Asset_Class,Profit_Loss&#10;2026-06-10,AMD,BUY,100,Equity,182.50&#10;2026-06-12,TSLA,SELL,5,Option,-240.00`}
+              placeholder={`Date_Closed,Symbol,Action,Amount,Asset_Class,Profit_Loss\n2026-06-10,AMD,BUY,100,Equity,182.50\n2026-06-12,TSLA,SELL,5,Option,-240.00`}
               value={csvText}
               onChange={(e) => setCsvText(e.target.value)}
             ></textarea>
@@ -925,7 +897,6 @@ export default function App() {
           </div>
         </div>
       ) : (
-        /* Dynamic CSV Header Mapping UI */
         <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-6 space-y-6 animate-fade-in">
           <div>
             <div className="flex justify-between items-center mb-2">
@@ -947,11 +918,11 @@ export default function App() {
               <label className="block text-xs font-semibold text-slate-500 mb-1">Date Closed (Required)</label>
               <select 
                 className="w-full text-xs p-2.5 border border-slate-200 rounded-lg"
-                value={mappings.dateClose}
+                value={mappings.dateClose || ''}
                 onChange={(e) => setMappings({ ...mappings, dateClose: e.target.value })}
               >
                 <option value="">-- Choose Column --</option>
-                {csvPreviewHeaders.map((h, i) => <option key={i} value={i}>{h}</option>)}
+                {(csvPreviewHeaders || []).map((h, i) => <option key={i} value={i}>{h}</option>)}
               </select>
             </div>
 
@@ -959,11 +930,11 @@ export default function App() {
               <label className="block text-xs font-semibold text-slate-500 mb-1">Ticker / Symbol (Required)</label>
               <select 
                 className="w-full text-xs p-2.5 border border-slate-200 rounded-lg"
-                value={mappings.ticker}
+                value={mappings.ticker || ''}
                 onChange={(e) => setMappings({ ...mappings, ticker: e.target.value })}
               >
                 <option value="">-- Choose Column --</option>
-                {csvPreviewHeaders.map((h, i) => <option key={i} value={i}>{h}</option>)}
+                {(csvPreviewHeaders || []).map((h, i) => <option key={i} value={i}>{h}</option>)}
               </select>
             </div>
 
@@ -971,11 +942,11 @@ export default function App() {
               <label className="block text-xs font-semibold text-slate-500 mb-1">Profit / Loss (Required)</label>
               <select 
                 className="w-full text-xs p-2.5 border border-slate-200 rounded-lg"
-                value={mappings.pnl}
+                value={mappings.pnl || ''}
                 onChange={(e) => setMappings({ ...mappings, pnl: e.target.value })}
               >
                 <option value="">-- Choose Column --</option>
-                {csvPreviewHeaders.map((h, i) => <option key={i} value={i}>{h}</option>)}
+                {(csvPreviewHeaders || []).map((h, i) => <option key={i} value={i}>{h}</option>)}
               </select>
             </div>
 
@@ -983,11 +954,11 @@ export default function App() {
               <label className="block text-xs font-semibold text-slate-500 mb-1">Date Opened (Optional)</label>
               <select 
                 className="w-full text-xs p-2.5 border border-slate-200 rounded-lg"
-                value={mappings.dateOpen}
+                value={mappings.dateOpen || ''}
                 onChange={(e) => setMappings({ ...mappings, dateOpen: e.target.value })}
               >
                 <option value="">Same as Date Closed</option>
-                {csvPreviewHeaders.map((h, i) => <option key={i} value={i}>{h}</option>)}
+                {(csvPreviewHeaders || []).map((h, i) => <option key={i} value={i}>{h}</option>)}
               </select>
             </div>
 
@@ -995,23 +966,23 @@ export default function App() {
               <label className="block text-xs font-semibold text-slate-500 mb-1">Asset Type (Optional)</label>
               <select 
                 className="w-full text-xs p-2.5 border border-slate-200 rounded-lg"
-                value={mappings.type}
+                value={mappings.type || ''}
                 onChange={(e) => setMappings({ ...mappings, type: e.target.value })}
               >
                 <option value="">Default: Stock</option>
-                {csvPreviewHeaders.map((h, i) => <option key={i} value={i}>{h}</option>)}
+                {(csvPreviewHeaders || []).map((h, i) => <option key={i} value={i}>{h}</option>)}
               </select>
             </div>
 
             <div>
               <label className="block text-xs font-semibold text-slate-500 mb-1">Position Side (Optional)</label>
               <select 
-                className="w-full text-xs p-2.5 border border-slate-200 rounded-lg"
-                value={mappings.side}
+                className="w-full text-xs p-2.5 border border-slate-200 rounded-lg font-medium"
+                value={mappings.side || ''}
                 onChange={(e) => setMappings({ ...mappings, side: e.target.value })}
               >
                 <option value="">Default: Long</option>
-                {csvPreviewHeaders.map((h, i) => <option key={i} value={i}>{h}</option>)}
+                {(csvPreviewHeaders || []).map((h, i) => <option key={i} value={i}>{h}</option>)}
               </select>
             </div>
           </div>
@@ -1023,15 +994,15 @@ export default function App() {
               <table className="w-full text-[11px] text-left border-collapse bg-slate-50/50">
                 <thead>
                   <tr className="bg-slate-100 border-b border-slate-200">
-                    {csvPreviewHeaders.map((h, i) => (
+                    {(csvPreviewHeaders || []).map((h, i) => (
                       <th key={i} className="p-2 font-bold text-slate-500">{h}</th>
                     ))}
                   </tr>
                 </thead>
                 <tbody>
-                  {csvPreviewRows.map((row, rIdx) => (
+                  {(csvPreviewRows || []).map((row, rIdx) => (
                     <tr key={rIdx} className="border-b border-slate-100 bg-white">
-                      {row.map((cell, cIdx) => (
+                      {(row || []).map((cell, cIdx) => (
                         <td key={cIdx} className="p-2 text-slate-600">{cell}</td>
                       ))}
                     </tr>
@@ -1219,25 +1190,25 @@ export default function App() {
               onClick={() => setActiveTab('dashboard')}
               className={`w-full flex items-center px-3 py-2.5 rounded-xl transition text-xs font-semibold ${activeTab === 'dashboard' ? 'bg-indigo-600 text-white' : 'hover:bg-slate-800/60 hover:text-white'}`}
             >
-              <LayoutDashboard className="h-4.5 w-4.5 mr-3" /> Portfolio Dashboard
+              <LayoutDashboard className="h-5 w-5 mr-3" /> Portfolio Dashboard
             </button>
             <button 
               onClick={() => setActiveTab('calendar')}
               className={`w-full flex items-center px-3 py-2.5 rounded-xl transition text-xs font-semibold ${activeTab === 'calendar' ? 'bg-indigo-600 text-white' : 'hover:bg-slate-800/60 hover:text-white'}`}
             >
-              <CalendarIcon className="h-4.5 w-4.5 mr-3" /> P/L Calendar
+              <CalendarIcon className="h-5 w-5 mr-3" /> P/L Calendar
             </button>
             <button 
               onClick={() => setActiveTab('log')}
               className={`w-full flex items-center px-3 py-2.5 rounded-xl transition text-xs font-semibold ${activeTab === 'log' ? 'bg-indigo-600 text-white' : 'hover:bg-slate-800/60 hover:text-white'}`}
             >
-              <List className="h-4.5 w-4.5 mr-3" /> Executed Trade Log
+              <List className="h-5 w-5 mr-3" /> Executed Trade Log
             </button>
             <button 
               onClick={() => setActiveTab('import')}
               className={`w-full flex items-center px-3 py-2.5 rounded-xl transition text-xs font-semibold ${activeTab === 'import' ? 'bg-indigo-600 text-white' : 'hover:bg-slate-800/60 hover:text-white'}`}
             >
-              <Upload className="h-4.5 w-4.5 mr-3" /> CSV File Importer
+              <Upload className="h-5 w-5 mr-3" /> CSV File Importer
             </button>
           </nav>
         </div>
@@ -1272,7 +1243,6 @@ export default function App() {
           </div>
           
           <div className="flex flex-wrap items-center gap-3">
-            {/* Timeline Filter */}
             <div className="flex flex-col">
               <span className="text-[9px] font-bold text-slate-400 uppercase tracking-wider mb-1">Time Range</span>
               <select 
@@ -1289,7 +1259,6 @@ export default function App() {
               </select>
             </div>
 
-            {/* Custom Dates (Conditional rendering) */}
             {dateFilter === 'custom' && (
               <>
                 <div className="flex flex-col">
@@ -1313,7 +1282,6 @@ export default function App() {
               </>
             )}
 
-            {/* Tickers Filter */}
             <div className="flex flex-col">
               <span className="text-[9px] font-bold text-slate-400 uppercase tracking-wider mb-1">Ticker Selection</span>
               <select 
@@ -1325,7 +1293,6 @@ export default function App() {
               </select>
             </div>
 
-            {/* Instruments Types Filter */}
             <div className="flex flex-col">
               <span className="text-[9px] font-bold text-slate-400 uppercase tracking-wider mb-1">Asset Class</span>
               <select 
