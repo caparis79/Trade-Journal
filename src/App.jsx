@@ -238,6 +238,11 @@ export default function App() {
     }
   };
 
+  const loadSampleData = () => {
+    setTrades(initialTrades);
+    showToast("Demo logs successfully restored!");
+  };
+
   const handleBulkImport = async (importedList) => {
     if (db && user) {
       setIsSyncing(true);
