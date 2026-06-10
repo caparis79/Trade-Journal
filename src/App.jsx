@@ -413,7 +413,10 @@ export default function App() {
       return;
     }
 
-    let cleanedInput = csvText.replace(/\/gi, '');
+    // Defensive construction prevents string-stripper filters from corrupting regex
+    const cleanPattern = new RegExp('\\[' + 'source' + ':\\s*\\d+\\]', 'gi');
+    let cleanedInput = csvText.replace(cleanPattern, '');
+    
     let rawLines = cleanedInput.split(/\r?\n/);
     let sanitizedLines = [];
     let activeRowBuffer = "";
@@ -444,90 +447,4 @@ export default function App() {
     if (fifoMatchedTrades && fifoMatchedTrades.length > 0) {
       handleBulkImport(fifoMatchedTrades);
       setCsvText('');
-      setIsMappingMode(false);
-      return;
-    }
-
-    const headers = parseCSVLine(sanitizedLines[0]);
-    const previewRows = sanitizedLines.slice(1, 4).map(line => parseCSVLine(line));
-
-    setCsvPreviewHeaders(headers || []);
-    setCsvPreviewRows(previewRows || []);
-
-    const detected = { dateOpen: '', dateClose: '', ticker: '', type: '', side: '', pnl: '' };
-    headers.forEach((h, index) => {
-      if (!h) return;
-      const lower = h.toLowerCase();
-      if (lower.includes('open') && lower.includes('date')) detected.dateOpen = String(index);
-      else if (lower.includes('close') && lower.includes('date')) detected.dateClose = String(index);
-      else if (lower.includes('date') && !detected.dateClose) detected.dateClose = String(index);
-      else if (lower.includes('ticker') || lower.includes('symbol')) detected.ticker = String(index);
-      else if (lower.includes('type') || lower.includes('asset')) detected.type = String(index);
-      else if (lower.includes('side') || lower.includes('action')) detected.side = String(index);
-      else if (lower.includes('pnl') || lower.includes('p/l') || lower.includes('profit') || lower.includes('gain') || lower.includes('total')) detected.pnl = String(index);
-    });
-
-    setMappings(detected);
-    setIsMappingMode(true);
-  };
-
-  const executeCsvImport = () => {
-    if (!mappings.dateClose || !mappings.ticker || !mappings.pnl) {
-      showToast("Required validation failure: Map Closed Date, Ticker, and Net P/L.", "error");
-      return;
-    }
-
-    try {
-      let cleanedInput = csvText.replace(/\/gi, '');
-      let rawLines = cleanedInput.split(/\r?\n/);
-      let sanitizedLines = [];
-      let activeRowBuffer = "";
-
-      for (let line of rawLines) {
-        line = line.trim();
-        if (!line) continue;
-        if (!activeRowBuffer) { activeRowBuffer = line; } 
-        else {
-          if (/^\d{4}-\d{2}-\d{2}/.test(line) || /^date,/i.test(line)) {
-            sanitizedLines.push(activeRowBuffer);
-            activeRowBuffer = line;
-          } else {
-            activeRowBuffer += " " + line;
-          }
-        }
-      }
-      if (activeRowBuffer) sanitizedLines.push(activeRowBuffer);
-
-      const rows = sanitizedLines.slice(1);
-      const parsedTrades = [];
-
-      rows.forEach(row => {
-        const cells = parseCSVLine(row);
-        if (cells.length < 2) return;
-
-        const dateCloseVal = cells[parseInt(mappings.dateClose, 10)];
-        const tickerVal = cells[parseInt(mappings.ticker, 10)];
-        const pnlRaw = cells[parseInt(mappings.pnl, 10)];
-
-        if (!dateCloseVal || !tickerVal || pnlRaw === undefined) return;
-
-        const dateOpenVal = mappings.dateOpen ? cells[parseInt(mappings.dateOpen, 10)] : dateCloseVal;
-        const typeVal = mappings.type ? cells[parseInt(mappings.type, 10)] : 'Stock';
-        const sideVal = mappings.side ? cells[parseInt(mappings.side, 10)] : 'Long';
-        const cleanedPnl = parseFloat(pnlRaw.replace(/[^0-9.-]/g, '')) || 0;
-
-        parsedTrades.push({
-          dateOpen: dateOpenVal || dateCloseVal,
-          dateClose: dateCloseVal.split('T')[0],
-          ticker: tickerVal.split(' ')[0].toUpperCase(),
-          type: typeVal || 'Stock',
-          side: sideVal || 'Long',
-          pnl: cleanedPnl
-        });
-      });
-
-      if (parsedTrades.length > 0) {
-        handleBulkImport(parsedTrades);
-        setIsMappingMode(false);
-        setCsvText('');
-      } else
+      setIsMappingMode(
