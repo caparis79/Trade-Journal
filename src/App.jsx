@@ -5,11 +5,9 @@ import {
   List, 
   Upload, 
   TrendingUp, 
-  TrendingDown, 
   DollarSign, 
   Target,
   BarChart3,
-  FileText,
   Activity,
   ChevronLeft,
   ChevronRight,
@@ -21,8 +19,7 @@ import {
   Plus,
   Cloud,
   CloudOff,
-  CloudLightning,
-  HelpCircle
+  CloudLightning
 } from 'lucide-react';
 
 // Firebase SDK imports
@@ -56,10 +53,25 @@ const initialTrades = [
   { id: "7", dateOpen: "2026-06-10", dateClose: "2026-06-10", ticker: "MSFT", type: "Stock", side: "Long", pnl: 120.00 },
   { id: "8", dateOpen: "2026-06-11", dateClose: "2026-06-12", ticker: "TSLA", type: "Option", side: "Long", pnl: -200.00 },
   { id: "9", dateOpen: "2026-06-12", dateClose: "2026-06-15", ticker: "NVDA", type: "Stock", side: "Long", pnl: 340.00 },
-  { id: "10", dateOpen: "2026-06-16", dateClose: "2026-06-17", ticker: "ES_F", type: "Future", side: "Long", pnl: -150.00 },
-  { id: "11", dateOpen: "2026-06-18", dateClose: "2026-06-19", ticker: "SPY", type: "Option", side: "Short", pnl: 280.00 },
-  { id: "12", dateOpen: "2026-06-19", dateClose: "2026-06-19", ticker: "AAPL", type: "Stock", side: "Long", pnl: 90.00 }
+  { id: "10", dateOpen: "2026-06-16", dateClose: "2026-06-17", ticker: "ES_F", type: "Future", side: "Long", pnl: -150.00 }
 ];
+
+// Helper to cleanly parse CSV lines while respecting quotes with commas
+const parseCSVLine = (text) => {
+  const result = [];
+  let startValueIdx = 0;
+  let inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === '"') {
+      inQuotes = !inQuotes;
+    } else if (text[i] === ',' && !inQuotes) {
+      result.push(text.substring(startValueIdx, i).replace(/^["']|["']$/g, '').trim());
+      startValueIdx = i + 1;
+    }
+  }
+  result.push(text.substring(startValueIdx).replace(/^["']|["']$/g, '').trim());
+  return result;
+};
 
 export default function App() {
   const [trades, setTrades] = useState(initialTrades);
@@ -119,7 +131,7 @@ export default function App() {
     setConfirmModal({ message, onConfirm });
   };
 
-  // --- Auth Integration & Setup (RULE 3) ---
+  // --- Auth Integration & Setup ---
   useEffect(() => {
     if (!auth) {
       showToast("Running in local session mode (database connection unconfigured).", "info");
@@ -145,7 +157,7 @@ export default function App() {
     return () => unsubscribe();
   }, []);
 
-  // --- Synchronize with Firestore Database (RULE 1 & 3) ---
+  // --- Synchronize with Firestore Database ---
   useEffect(() => {
     if (!db || !user) return;
     setIsSyncing(true);
@@ -267,6 +279,114 @@ export default function App() {
     }
   };
 
+  // --- Tastytrade FIFO Processing Engine ---
+  const processTastytradeFIFO = (lines) => {
+    try {
+      const headers = parseCSVLine(lines[0]);
+      
+      const idxDate = headers.indexOf('Date');
+      const idxType = headers.indexOf('Type');
+      const idxAction = headers.indexOf('Action');
+      const idxSymbol = headers.indexOf('Symbol');
+      const idxUnderlying = headers.indexOf('Underlying Symbol');
+      const idxInstrument = headers.indexOf('Instrument Type');
+      const idxQuantity = headers.indexOf('Quantity');
+      const idxTotal = headers.indexOf('Total');
+
+      if (idxDate === -1 || idxAction === -1 || idxSymbol === -1 || idxTotal === -1) {
+        return null; // Fall back to the manual mapper if headers don't match Tastytrade format
+      }
+
+      const tradeRows = lines.slice(1).map(line => {
+        const cells = parseCSVLine(line);
+        if (cells.length < headers.length) return null;
+        return {
+          date: cells[idxDate],
+          type: cells[idxType],
+          action: cells[idxAction],
+          symbol: cells[idxSymbol],
+          underlying: cells[idxUnderlying] || cells[idxSymbol],
+          instrument: cells[idxInstrument] || 'Stock',
+          quantity: Math.abs(parseInt(cells[idxQuantity], 10)) || 1,
+          total: parseFloat(cells[idxTotal].replace(/[^0-9.-]/g, '')) || 0
+        };
+      })
+      .filter(r => r && r.type === 'Trade')
+      .sort((a, b) => new Date(a.date) - new Date(b.date));
+
+      const openPositions = {}; 
+      const completedClosedTrades = [];
+
+      tradeRows.forEach(row => {
+        const symbol = row.symbol;
+        const isOpening = row.action.includes('_OPEN') || row.action === 'BUY' || row.action === 'SELL';
+        const isClosing = row.action.includes('_CLOSE');
+
+        if (!openPositions[symbol]) {
+          openPositions[symbol] = [];
+        }
+
+        if (isOpening) {
+          openPositions[symbol].push({
+            qtyRemaining: row.quantity,
+            totalCost: row.total,
+            dateOpen: row.date.split('T')[0],
+            side: row.action.includes('BUY') ? 'Long' : 'Short',
+            ticker: row.underlying,
+            instrument: row.instrument
+          });
+        } else if (isClosing) {
+          let qtyToClose = row.quantity;
+          const queue = openPositions[symbol];
+
+          while (qtyToClose > 0 && queue && queue.length > 0) {
+            const firstOpen = queue[0];
+            const matchQty = Math.min(qtyToClose, firstOpen.qtyRemaining);
+
+            const openCostProportional = (firstOpen.totalCost / firstOpen.qtyRemaining) * matchQty;
+            const closeCreditProportional = (row.total / row.quantity) * matchQty;
+
+            // Adding directly because debits are negative values and credits are positive values
+            const pnl = openCostProportional + closeCreditProportional;
+
+            completedClosedTrades.push({
+              dateOpen: firstOpen.dateOpen,
+              dateClose: row.date.split('T')[0],
+              ticker: firstOpen.ticker.toUpperCase(),
+              type: firstOpen.instrument === 'Equity Option' ? 'Option' : firstOpen.instrument,
+              side: firstOpen.side,
+              pnl: pnl
+            });
+
+            qtyToClose -= matchQty;
+            firstOpen.qtyRemaining -= matchQty;
+
+            if (firstOpen.qtyRemaining <= 0) {
+              queue.shift();
+            }
+          }
+
+          // Handle orphaned close executions without a corresponding open inside this export window
+          if (qtyToClose > 0) {
+            completedClosedTrades.push({
+              dateOpen: row.date.split('T')[0],
+              dateClose: row.date.split('T')[0],
+              ticker: row.underlying.toUpperCase(),
+              type: row.instrument === 'Equity Option' ? 'Option' : row.instrument,
+              side: row.action.includes('BUY') ? 'Short' : 'Long',
+              pnl: (row.total / row.quantity) * qtyToClose
+            });
+          }
+        }
+      });
+
+      return completedClosedTrades;
+    } catch (err) {
+      console.error("Tastytrade processing failure", err);
+      return null;
+    }
+  };
+
   // --- CSV Parser & Mapper Logic ---
   const startCsvMapping = () => {
     if (!csvText || !csvText.trim()) {
@@ -279,13 +399,22 @@ export default function App() {
       return;
     }
 
-    const headers = lines[0].split(',').map(h => h.trim().replace(/^["']|["']$/g, ''));
-    const previewRows = lines.slice(1, 4).map(line => line.split(',').map(v => v.trim().replace(/^["']|["']$/g, '')));
+    // 1. Run automatic Tastytrade detection engine
+    const fifoMatchedTrades = processTastytradeFIFO(lines);
+    if (fifoMatchedTrades && fifoMatchedTrades.length > 0) {
+      handleBulkImport(fifoMatchedTrades);
+      setCsvText('');
+      setIsMappingMode(false);
+      return;
+    }
+
+    // 2. Standard CSV manual fallback mapping layout rules
+    const headers = parseCSVLine(lines[0]);
+    const previewRows = lines.slice(1, 4).map(line => parseCSVLine(line));
 
     setCsvPreviewHeaders(headers || []);
     setCsvPreviewRows(previewRows || []);
 
-    // Dynamic Autodetect Mapping Rules
     const detected = { dateOpen: '', dateClose: '', ticker: '', type: '', side: '', pnl: '' };
     headers.forEach((h, index) => {
       const lower = h.toLowerCase();
@@ -314,7 +443,7 @@ export default function App() {
       const parsedTrades = [];
 
       rows.forEach(row => {
-        const cells = row.split(',').map(c => c.trim().replace(/^["']|["']$/g, ''));
+        const cells = parseCSVLine(row);
         if (cells.length < 2) return;
 
         const dateCloseVal = cells[parseInt(mappings.dateClose, 10)];
@@ -327,7 +456,6 @@ export default function App() {
         const typeVal = mappings.type ? cells[parseInt(mappings.type, 10)] : 'Stock';
         const sideVal = mappings.side ? cells[parseInt(mappings.side, 10)] : 'Long';
 
-        // Clean PNL signs/dollar-symbols
         const cleanedPnl = parseFloat(pnlRaw.replace(/[^0-9.-]/g, '')) || 0;
 
         parsedTrades.push({
@@ -355,13 +483,9 @@ export default function App() {
   // --- Dynamic Filters Processing ---
   const processedTrades = useMemo(() => {
     return (trades || []).filter(t => {
-      // 1. Ticker filter
       if (selectedTicker !== 'All' && t.ticker !== selectedTicker) return false;
-      
-      // 2. Asset Type filter
       if (selectedType !== 'All' && t.type !== selectedType) return false;
 
-      // 3. Date filters
       const closeDate = new Date(t.dateClose);
       const today = new Date();
       today.setHours(0,0,0,0);
@@ -403,7 +527,6 @@ export default function App() {
     });
   }, [trades, dateFilter, startDate, endDate, selectedTicker, selectedType]);
 
-  // --- Unique Filters list generation ---
   const tickerOptions = useMemo(() => {
     const list = new Set((trades || []).map(t => t.ticker));
     return ['All', ...Array.from(list).sort()];
@@ -417,7 +540,7 @@ export default function App() {
   // --- Statistics Calculations ---
   const metrics = useMemo(() => {
     if (!processedTrades || processedTrades.length === 0) {
-      return { totalPnl: 0, winRate: 0, profitFactor: 0, totalTrades: 0, winningTrades: 0, losingTrades: 0, avgWin: 0, avgLoss: 0 };
+      return { totalPnl: 0, winRate: 0, profitFactor: 0, totalTrades: 0, wins: 0, losses: 0, avgWin: 0, avgLoss: 0 };
     }
 
     let grossProfit = 0;
@@ -445,7 +568,6 @@ export default function App() {
     return { totalPnl, winRate, profitFactor, totalTrades: processedTrades.length, wins, losses, avgWin, avgLoss };
   }, [processedTrades]);
 
-  // Tickers breakdown table metrics
   const tickerStats = useMemo(() => {
     const data = {};
     (processedTrades || []).forEach(t => {
@@ -464,7 +586,6 @@ export default function App() {
       .sort((a, b) => b.pnl - a.pnl);
   }, [processedTrades]);
 
-  // --- Chart Processing logic ---
   const equityCurvePoints = useMemo(() => {
     const sorted = [...(processedTrades || [])].sort((a, b) => new Date(a.dateClose) - new Date(b.dateClose));
     let runningSum = 0;
@@ -486,7 +607,7 @@ export default function App() {
           <div className="h-64 flex flex-col items-center justify-center text-slate-400 bg-slate-50 rounded-xl border border-dashed border-slate-200">
             <Activity className="h-10 w-10 mb-2 text-slate-300" />
             <p className="text-sm font-medium">Insufficient trade data to render trend analytics</p>
-            <p className="text-xs text-slate-400">Add 2 or more close executions to view performance trajectory</p>
+            <p className="text-xs text-slate-400">Add or import 2 or more close executions to view performance trajectory</p>
           </div>
         );
       }
@@ -557,7 +678,7 @@ export default function App() {
 
     return (
       <div className="space-y-6">
-        {/* KPI Cards */}
+        {/* KPI Row */}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
           <div className="bg-white p-6 rounded-xl border border-slate-200 shadow-sm flex items-center space-x-4">
             <div className={`p-3 rounded-full ${metrics.totalPnl >= 0 ? 'bg-emerald-100 text-emerald-600' : 'bg-rose-100 text-rose-600'}`}>
@@ -606,14 +727,13 @@ export default function App() {
           </div>
         </div>
 
-        {/* Charts and Visual Analytics */}
+        {/* Charts Section */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
           <div className="bg-white lg:col-span-2 rounded-xl border border-slate-200 shadow-sm overflow-hidden flex flex-col justify-between">
             <div className="p-5 border-b border-slate-100 bg-slate-50 flex justify-between items-center">
               <h2 className="text-sm font-semibold text-slate-800 uppercase tracking-wider flex items-center">
                 <Activity className="mr-2 h-4 w-4 text-sky-500" /> Equity Curve Tracking
               </h2>
-              <span className="text-xs bg-slate-100 px-2.5 py-1 text-slate-600 rounded-full font-medium">Interactive Graph</span>
             </div>
             <div className="p-6">
               {buildEquityCurve()}
@@ -642,26 +762,11 @@ export default function App() {
               <div className="w-full bg-slate-100 h-2 rounded-full overflow-hidden">
                 <div className="bg-rose-500 h-full" style={{ width: `${100 - metrics.winRate}%` }}></div>
               </div>
-
-              <div className="pt-4 border-t border-slate-100 space-y-2">
-                <div className="flex justify-between text-xs">
-                  <span className="text-slate-400">Total Profit Captured:</span>
-                  <span className="font-bold text-slate-700">
-                    ${(parseFloat(metrics.wins) * parseFloat(metrics.avgWin)).toFixed(2)}
-                  </span>
-                </div>
-                <div className="flex justify-between text-xs">
-                  <span className="text-slate-400">Total Drawdown Losses:</span>
-                  <span className="font-bold text-slate-700">
-                    -${(parseFloat(metrics.losses) * parseFloat(metrics.avgLoss)).toFixed(2)}
-                  </span>
-                </div>
-              </div>
             </div>
           </div>
         </div>
 
-        {/* Performance by Ticker Table */}
+        {/* Ticker Summary */}
         <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
           <div className="p-5 border-b border-slate-100 bg-slate-50">
             <h2 className="text-sm font-semibold text-slate-800 uppercase tracking-wider flex items-center">
@@ -761,11 +866,9 @@ export default function App() {
     return (
       <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
         <div className="p-5 border-b border-slate-100 bg-slate-50 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-          <div className="flex items-center space-x-3">
-            <h2 className="text-lg font-bold text-slate-800 flex items-center">
-              <CalendarIcon className="mr-2 h-5 w-5 text-indigo-500" /> {monthNames[calendarMonth]} {calendarYear}
-            </h2>
-          </div>
+          <h2 className="text-lg font-bold text-slate-800 flex items-center">
+            <CalendarIcon className="mr-2 h-5 w-5 text-indigo-500" /> {monthNames[calendarMonth]} {calendarYear}
+          </h2>
           <div className="flex items-center space-x-2">
             <button onClick={() => changeMonth('prev')} className="p-2 border border-slate-200 rounded-lg bg-white hover:bg-slate-50 text-slate-600 transition">
               <ChevronLeft size={16} />
@@ -782,13 +885,11 @@ export default function App() {
             </button>
           </div>
         </div>
-        <div className="p-0">
-          <div className="grid grid-cols-7 text-center border-b border-slate-100 bg-slate-50/50 text-[10px] font-bold text-slate-400 py-3 uppercase tracking-wider">
-            <div>Sun</div><div>Mon</div><div>Tue</div><div>Wed</div><div>Thu</div><div>Fri</div><div>Sat</div>
-          </div>
-          <div className="grid grid-cols-7">
-            {calendarCells}
-          </div>
+        <div className="grid grid-cols-7 text-center border-b border-slate-100 bg-slate-50/50 text-[10px] font-bold text-slate-400 py-3 uppercase tracking-wider">
+          <div>Sun</div><div>Mon</div><div>Tue</div><div>Wed</div><div>Thu</div><div>Fri</div><div>Sat</div>
+        </div>
+        <div className="grid grid-cols-7">
+          {calendarCells}
         </div>
       </div>
     );
@@ -822,16 +923,16 @@ export default function App() {
           </thead>
           <tbody className="divide-y divide-slate-100 text-sm">
             {processedTrades.length === 0 ? (
-              <tr><td colSpan="7" className="p-8 text-center text-slate-500 font-medium">No recorded trades match current filters. Try relaxing filters.</td></tr>
+              <tr><td colSpan="7" className="p-8 text-center text-slate-500 font-medium">No recorded trades match filters.</td></tr>
             ) : processedTrades.sort((a,b) => new Date(b.dateClose) - new Date(a.dateClose)).map((t, i) => (
               <tr key={t.id || i} className="hover:bg-slate-50 transition text-sm">
                 <td className="p-4 text-slate-600">{t.dateOpen}</td>
                 <td className="p-4 text-slate-800 font-medium">{t.dateClose}</td>
                 <td className="p-4 font-bold text-slate-900">{t.ticker}</td>
-                <td className="p-4 text-slate-600">
+                <td className="p-4">
                   <span className="px-2 py-0.5 bg-slate-100 text-slate-700 rounded-md text-[11px] font-semibold">{t.type}</span>
                 </td>
-                <td className="p-4 text-slate-600">
+                <td className="p-4">
                   <span className={`px-2 py-0.5 rounded-md text-[11px] font-bold uppercase tracking-wider ${t.side.toLowerCase() === 'long' ? 'bg-sky-50 text-sky-700' : 'bg-purple-50 text-purple-700'}`}>
                     {t.side}
                   </span>
@@ -843,7 +944,6 @@ export default function App() {
                   <button
                     onClick={() => triggerConfirm(`Are you sure you want to delete trade on ${t.ticker}?`, () => handleDeleteTrade(t.id))}
                     className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition"
-                    title="Remove trade"
                   >
                     <Trash2 size={15} />
                   </button>
@@ -864,13 +964,13 @@ export default function App() {
             <h2 className="text-sm font-semibold text-slate-800 uppercase tracking-wider flex items-center mb-1">
               <Upload className="mr-2 h-4 w-4 text-indigo-500" /> Interactive Brokerage Import
             </h2>
-            <p className="text-xs text-slate-500">Paste raw trade CSV data directly from your brokerage export. We will analyze and map your custom column headers dynamically.</p>
+            <p className="text-xs text-slate-500">Paste raw CSV files from your brokerage. The engine auto-detects Tastytrade files and calculates closed trade profits using dynamic FIFO handling.</p>
           </div>
           
           <div className="space-y-3">
             <textarea 
               className="w-full h-44 p-4 border border-slate-200 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 text-xs font-mono bg-slate-50/50"
-              placeholder={`Date_Closed,Symbol,Action,Amount,Asset_Class,Profit_Loss\n2026-06-10,AMD,BUY,100,Equity,182.50\n2026-06-12,TSLA,SELL,5,Option,-240.00`}
+              placeholder={`Paste your transaction history or closed orders CSV raw text here...`}
               value={csvText}
               onChange={(e) => setCsvText(e.target.value)}
             ></textarea>
@@ -880,7 +980,7 @@ export default function App() {
                 onClick={startCsvMapping}
                 className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-semibold shadow-sm transition"
               >
-                Analyze Columns & Map Headers
+                Process File & Map Logs
               </button>
               
               <button 
@@ -902,20 +1002,14 @@ export default function App() {
           </div>
         </div>
       ) : (
-        <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-6 space-y-6 animate-fade-in">
-          <div>
-            <div className="flex justify-between items-center mb-2">
-              <h2 className="text-base font-bold text-slate-800 flex items-center">
-                <Upload className="mr-2 h-5 w-5 text-indigo-500" /> Confirm Header Mappings
-              </h2>
-              <button 
-                onClick={() => setIsMappingMode(false)}
-                className="p-1 text-slate-400 hover:text-slate-600 rounded-lg hover:bg-slate-100 transition"
-              >
-                <X size={16} />
-              </button>
-            </div>
-            <p className="text-xs text-slate-500">We auto-detected some brokerage column layout matches. Please double-check and assign correct mappings before committing the imports.</p>
+        <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-6 space-y-6">
+          <div className="flex justify-between items-center mb-2">
+            <h2 className="text-base font-bold text-slate-800 flex items-center">
+              <Upload className="mr-2 h-5 w-5 text-indigo-500" /> Manual Fallback Column Mapping
+            </h2>
+            <button onClick={() => setIsMappingMode(false)} className="p-1 text-slate-400 hover:text-slate-600">
+              <X size={16} />
+            </button>
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -980,9 +1074,9 @@ export default function App() {
             </div>
 
             <div>
-              <label className="block text-xs font-semibold text-slate-500 mb-1">Position Side (Optional)</label>
+              <label className="block text-xs font-semibold text-slate-500 mb-1">Side (Optional)</label>
               <select 
-                className="w-full text-xs p-2.5 border border-slate-200 rounded-lg font-medium"
+                className="w-full text-xs p-2.5 border border-slate-200 rounded-lg"
                 value={mappings.side || ''}
                 onChange={(e) => setMappings({ ...mappings, side: e.target.value })}
               >
@@ -992,43 +1086,12 @@ export default function App() {
             </div>
           </div>
 
-          {/* Sample Rows Preview Table */}
-          <div className="space-y-2">
-            <h3 className="text-xs font-bold text-slate-700 uppercase tracking-wide">Data Parsing Sample Row Preview</h3>
-            <div className="overflow-x-auto max-h-32 border border-slate-100 rounded-lg">
-              <table className="w-full text-[11px] text-left border-collapse bg-slate-50/50">
-                <thead>
-                  <tr className="bg-slate-100 border-b border-slate-200">
-                    {(csvPreviewHeaders || []).map((h, i) => (
-                      <th key={i} className="p-2 font-bold text-slate-500">{h}</th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {(csvPreviewRows || []).map((row, rIdx) => (
-                    <tr key={rIdx} className="border-b border-slate-100 bg-white">
-                      {(row || []).map((cell, cIdx) => (
-                        <td key={cIdx} className="p-2 text-slate-600">{cell}</td>
-                      ))}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-
-          <div className="flex justify-end space-x-2 border-t border-slate-100 pt-4">
-            <button 
-              onClick={() => setIsMappingMode(false)}
-              className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs font-semibold transition"
-            >
+          <div className="flex justify-end space-x-2 pt-4 border-t border-slate-100">
+            <button onClick={() => setIsMappingMode(false)} className="px-4 py-2 bg-slate-100 text-slate-700 rounded-lg text-xs font-semibold">
               Cancel
             </button>
-            <button 
-              onClick={executeCsvImport}
-              className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-semibold shadow-sm transition"
-            >
-              Confirm Import & Parse CSV
+            <button onClick={executeCsvImport} className="px-4 py-2 bg-indigo-600 text-white rounded-lg text-xs font-semibold shadow-sm">
+              Confirm Import
             </button>
           </div>
         </div>
@@ -1038,35 +1101,23 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col md:flex-row font-sans text-slate-900 antialiased">
-      
-      {/* Toast Alert Banner */}
       {toast && (
-        <div className="fixed bottom-5 right-5 z-50 bg-slate-900 text-white px-4.5 py-3 rounded-xl shadow-lg border border-slate-800 flex items-center space-x-3 transition animate-slide-up">
+        <div className="fixed bottom-5 right-5 z-50 bg-slate-900 text-white px-4.5 py-3 rounded-xl shadow-lg border border-slate-800 flex items-center space-x-3">
           {toast.type === 'error' ? <AlertCircle className="text-rose-500 h-5 w-5" /> : <CheckCircle2 className="text-emerald-500 h-5 w-5" />}
           <span className="text-xs font-semibold">{toast.message}</span>
         </div>
       )}
 
-      {/* Confirmation Modal Overlay */}
       {confirmModal && (
         <div className="fixed inset-0 z-50 bg-slate-900/60 flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl border border-slate-200 p-6 max-w-sm w-full space-y-4 shadow-xl">
-            <h3 className="text-sm font-bold text-slate-800">Please Confirm Execution</h3>
+          <div className="bg-white rounded-2xl p-6 max-w-sm w-full space-y-4 shadow-xl">
+            <h3 className="text-sm font-bold text-slate-800">Confirm Action</h3>
             <p className="text-xs text-slate-500">{confirmModal.message}</p>
             <div className="flex justify-end space-x-2 pt-2">
-              <button
-                onClick={() => setConfirmModal(null)}
-                className="px-3.5 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs font-bold transition"
-              >
+              <button onClick={() => setConfirmModal(null)} className="px-3.5 py-1.5 bg-slate-100 text-slate-700 rounded-lg text-xs font-bold">
                 Dismiss
               </button>
-              <button
-                onClick={() => {
-                  confirmModal.onConfirm();
-                  setConfirmModal(null);
-                }}
-                className="px-3.5 py-1.5 bg-rose-600 hover:bg-rose-700 text-white rounded-lg text-xs font-bold transition"
-              >
+              <button onClick={() => { confirmModal.onConfirm(); setConfirmModal(null); }} className="px-3.5 py-1.5 bg-rose-600 text-white rounded-lg text-xs font-bold">
                 Confirm
               </button>
             </div>
@@ -1074,10 +1125,9 @@ export default function App() {
         </div>
       )}
 
-      {/* Manual Entry Modal Dialog */}
       {isAddModalOpen && (
         <div className="fixed inset-0 z-40 bg-slate-900/60 flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl border border-slate-200 p-6 max-w-md w-full space-y-4 shadow-xl">
+          <div className="bg-white rounded-2xl p-6 max-w-md w-full space-y-4 shadow-xl">
             <div className="flex justify-between items-center">
               <h3 className="text-sm font-bold text-slate-800 uppercase tracking-wider">Log Manual Executed Trade</h3>
               <button onClick={() => setIsAddModalOpen(false)} className="text-slate-400 hover:text-slate-600">
@@ -1100,7 +1150,7 @@ export default function App() {
                 <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">Net P/L ($)</label>
                 <input 
                   type="number" 
-                  placeholder="e.g. 150.00 or -45.50" 
+                  placeholder="e.g. 150.00" 
                   className="w-full text-xs p-2.5 border border-slate-200 rounded-lg"
                   value={newTrade.pnl}
                   onChange={(e) => setNewTrade({ ...newTrade, pnl: e.target.value })}
@@ -1116,65 +1166,44 @@ export default function App() {
                   <option value="Stock">Stock</option>
                   <option value="Option">Option</option>
                   <option value="Future">Future</option>
-                  <option value="Crypto">Crypto</option>
                 </select>
               </div>
               <div>
                 <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">Side</label>
                 <select 
-                  className="w-full text-xs p-2.5 border border-slate-200 rounded-lg font-medium"
+                  className="w-full text-xs p-2.5 border border-slate-200 rounded-lg"
                   value={newTrade.side}
                   onChange={(e) => setNewTrade({ ...newTrade, side: e.target.value })}
                 >
-                  <option value="Long">Long (BUY)</option>
-                  <option value="Short">Short (SELL/SHORT)</option>
+                  <option value="Long">Long</option>
+                  <option value="Short">Short</option>
                 </select>
               </div>
               <div>
                 <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">Opened Date</label>
-                <input 
-                  type="date" 
-                  className="w-full text-xs p-2.5 border border-slate-200 rounded-lg"
-                  value={newTrade.dateOpen}
-                  onChange={(e) => setNewTrade({ ...newTrade, dateOpen: e.target.value })}
-                />
+                <input type="date" className="w-full text-xs p-2.5 border border-slate-200 rounded-lg" value={newTrade.dateOpen} onChange={(e) => setNewTrade({ ...newTrade, dateOpen: e.target.value })} />
               </div>
               <div>
                 <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">Closed Date</label>
-                <input 
-                  type="date" 
-                  className="w-full text-xs p-2.5 border border-slate-200 rounded-lg font-bold"
-                  value={newTrade.dateClose}
-                  onChange={(e) => setNewTrade({ ...newTrade, dateClose: e.target.value })}
-                />
+                <input type="date" className="w-full text-xs p-2.5 border border-slate-200 rounded-lg font-bold" value={newTrade.dateClose} onChange={(e) => setNewTrade({ ...newTrade, dateClose: e.target.value })} />
               </div>
             </div>
 
             <div className="flex justify-end space-x-2 pt-4 border-t border-slate-100">
-              <button 
-                onClick={() => setIsAddModalOpen(false)}
-                className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs font-bold transition"
-              >
+              <button onClick={() => setIsAddModalOpen(false)} className="px-4 py-2 bg-slate-100 text-slate-700 rounded-lg text-xs font-bold">
                 Cancel
               </button>
               <button 
                 onClick={() => {
                   if (!newTrade.ticker || !newTrade.pnl) {
-                    showToast("Ticker and Net P/L must be filled out.", "error");
+                    showToast("Ticker and Net P/L are required.", "error");
                     return;
                   }
                   handleAddTrade(newTrade);
                   setIsAddModalOpen(false);
-                  setNewTrade({
-                    dateOpen: new Date().toISOString().split('T')[0],
-                    dateClose: new Date().toISOString().split('T')[0],
-                    ticker: '',
-                    type: 'Stock',
-                    side: 'Long',
-                    pnl: ''
-                  });
+                  setNewTrade({ dateOpen: new Date().toISOString().split('T')[0], dateClose: new Date().toISOString().split('T')[0], ticker: '', type: 'Stock', side: 'Long', pnl: '' });
                 }}
-                className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-bold transition"
+                className="px-4 py-2 bg-indigo-600 text-white rounded-lg text-xs font-bold"
               >
                 Save Trade Entry
               </button>
@@ -1183,7 +1212,7 @@ export default function App() {
         </div>
       )}
 
-      {/* Sidebar Navigation */}
+      {/* Sidebar Layout */}
       <aside className="w-full md:w-64 bg-slate-900 text-slate-300 flex-shrink-0 flex flex-col justify-between">
         <div className="p-6">
           <h1 className="text-xl font-extrabold text-white flex items-center">
@@ -1191,37 +1220,24 @@ export default function App() {
           </h1>
           
           <nav className="space-y-1.5 mt-8">
-            <button 
-              onClick={() => setActiveTab('dashboard')}
-              className={`w-full flex items-center px-3 py-2.5 rounded-xl transition text-xs font-semibold ${activeTab === 'dashboard' ? 'bg-indigo-600 text-white' : 'hover:bg-slate-800/60 hover:text-white'}`}
-            >
+            <button onClick={() => setActiveTab('dashboard')} className={`w-full flex items-center px-3 py-2.5 rounded-xl text-xs font-semibold ${activeTab === 'dashboard' ? 'bg-indigo-600 text-white' : 'hover:bg-slate-800/60'}`}>
               <LayoutDashboard className="h-5 w-5 mr-3" /> Portfolio Dashboard
             </button>
-            <button 
-              onClick={() => setActiveTab('calendar')}
-              className={`w-full flex items-center px-3 py-2.5 rounded-xl transition text-xs font-semibold ${activeTab === 'calendar' ? 'bg-indigo-600 text-white' : 'hover:bg-slate-800/60 hover:text-white'}`}
-            >
+            <button onClick={() => setActiveTab('calendar')} className={`w-full flex items-center px-3 py-2.5 rounded-xl text-xs font-semibold ${activeTab === 'calendar' ? 'bg-indigo-600 text-white' : 'hover:bg-slate-800/60'}`}>
               <CalendarIcon className="h-5 w-5 mr-3" /> P/L Calendar
             </button>
-            <button 
-              onClick={() => setActiveTab('log')}
-              className={`w-full flex items-center px-3 py-2.5 rounded-xl transition text-xs font-semibold ${activeTab === 'log' ? 'bg-indigo-600 text-white' : 'hover:bg-slate-800/60 hover:text-white'}`}
-            >
+            <button onClick={() => setActiveTab('log')} className={`w-full flex items-center px-3 py-2.5 rounded-xl text-xs font-semibold ${activeTab === 'log' ? 'bg-indigo-600 text-white' : 'hover:bg-slate-800/60'}`}>
               <List className="h-5 w-5 mr-3" /> Executed Trade Log
             </button>
-            <button 
-              onClick={() => setActiveTab('import')}
-              className={`w-full flex items-center px-3 py-2.5 rounded-xl transition text-xs font-semibold ${activeTab === 'import' ? 'bg-indigo-600 text-white' : 'hover:bg-slate-800/60 hover:text-white'}`}
-            >
+            <button onClick={() => setActiveTab('import')} className={`w-full flex items-center px-3 py-2.5 rounded-xl text-xs font-semibold ${activeTab === 'import' ? 'bg-indigo-600 text-white' : 'hover:bg-slate-800/60'}`}>
               <Upload className="h-5 w-5 mr-3" /> CSV File Importer
             </button>
           </nav>
         </div>
 
-        {/* Database Sync Status Guardrail */}
         <div className="p-4 bg-slate-950 border-t border-slate-800 m-4 rounded-xl space-y-2">
           <div className="flex items-center justify-between text-[11px] text-slate-400 font-semibold">
-            <span>Database Service</span>
+            <span>Database Status</span>
             {isSyncing ? (
               <span className="text-yellow-500 flex items-center"><CloudLightning size={12} className="mr-1 animate-pulse" /> Syncing</span>
             ) : db && user ? (
@@ -1231,30 +1247,22 @@ export default function App() {
             )}
           </div>
           {syncError && <p className="text-[10px] text-rose-400 leading-tight">{syncError}</p>}
-          <p className="text-[9px] text-slate-500 leading-relaxed">Trades are persistent during browser runtime sessions.</p>
         </div>
       </aside>
 
-      {/* Main Content Area */}
+      {/* Main Body View Layout Router */}
       <main className="flex-1 p-6 lg:p-8 overflow-y-auto max-h-screen">
-        
-        {/* Dynamic Filters Bar */}
         <header className="mb-6 bg-white p-5 rounded-2xl border border-slate-200 shadow-sm flex flex-col lg:flex-row justify-between lg:items-center gap-4">
           <div className="space-y-1">
             <h2 className="text-lg font-bold text-slate-800 flex items-center">
               <Filter className="mr-2 h-4 w-4 text-indigo-500" /> Active Filters
             </h2>
-            <p className="text-xs text-slate-500">Dynamically filtering statistics, calculations, and performance summaries</p>
           </div>
           
           <div className="flex flex-wrap items-center gap-3">
             <div className="flex flex-col">
               <span className="text-[9px] font-bold text-slate-400 uppercase tracking-wider mb-1">Time Range</span>
-              <select 
-                className="text-xs p-2 border border-slate-200 rounded-lg font-medium bg-slate-50 focus:bg-white"
-                value={dateFilter}
-                onChange={(e) => setDateFilter(e.target.value)}
-              >
+              <select className="text-xs p-2 border border-slate-200 rounded-lg bg-slate-50" value={dateFilter} onChange={(e) => setDateFilter(e.target.value)}>
                 <option value="all">All Time</option>
                 <option value="today">Today</option>
                 <option value="week">This Week</option>
@@ -1268,50 +1276,31 @@ export default function App() {
               <>
                 <div className="flex flex-col">
                   <span className="text-[9px] font-bold text-slate-400 uppercase tracking-wider mb-1">Start Date</span>
-                  <input 
-                    type="date" 
-                    className="text-xs p-2 border border-slate-200 rounded-lg bg-slate-50"
-                    value={startDate}
-                    onChange={(e) => setStartDate(e.target.value)}
-                  />
+                  <input type="date" className="text-xs p-2 border border-slate-200 rounded-lg bg-slate-50" value={startDate} onChange={(e) => setStartDate(e.target.value)} />
                 </div>
                 <div className="flex flex-col">
                   <span className="text-[9px] font-bold text-slate-400 uppercase tracking-wider mb-1">End Date</span>
-                  <input 
-                    type="date" 
-                    className="text-xs p-2 border border-slate-200 rounded-lg bg-slate-50"
-                    value={endDate}
-                    onChange={(e) => setEndDate(e.target.value)}
-                  />
+                  <input type="date" className="text-xs p-2 border border-slate-200 rounded-lg bg-slate-50" value={endDate} onChange={(e) => setEndDate(e.target.value)} />
                 </div>
               </>
             )}
 
             <div className="flex flex-col">
-              <span className="text-[9px] font-bold text-slate-400 uppercase tracking-wider mb-1">Ticker Selection</span>
-              <select 
-                className="text-xs p-2 border border-slate-200 rounded-lg font-medium bg-slate-50 focus:bg-white"
-                value={selectedTicker}
-                onChange={(e) => setSelectedTicker(e.target.value)}
-              >
+              <span className="text-[9px] font-bold text-slate-400 uppercase tracking-wider mb-1">Ticker</span>
+              <select className="text-xs p-2 border border-slate-200 rounded-lg bg-slate-50" value={selectedTicker} onChange={(e) => setSelectedTicker(e.target.value)}>
                 {tickerOptions.map(tick => <option key={tick} value={tick}>{tick}</option>)}
               </select>
             </div>
 
             <div className="flex flex-col">
               <span className="text-[9px] font-bold text-slate-400 uppercase tracking-wider mb-1">Asset Class</span>
-              <select 
-                className="text-xs p-2 border border-slate-200 rounded-lg font-medium bg-slate-50 focus:bg-white"
-                value={selectedType}
-                onChange={(e) => setSelectedType(e.target.value)}
-              >
+              <select className="text-xs p-2 border border-slate-200 rounded-lg bg-slate-50" value={selectedType} onChange={(e) => setSelectedType(e.target.value)}>
                 {typeOptions.map(t => <option key={t} value={t}>{t}</option>)}
               </select>
             </div>
           </div>
         </header>
 
-        {/* View Router */}
         <div className="max-w-6xl mx-auto">
           {activeTab === 'dashboard' && renderDashboard()}
           {activeTab === 'calendar' && renderCalendar()}
