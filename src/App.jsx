@@ -44,16 +44,11 @@ if (firebaseConfig) {
 
 // --- Hardcoded Initial/Fallback Dataset ---
 const initialTrades = [
-  { id: "1", dateOpen: "2026-06-01", dateClose: "2026-06-02", ticker: "AAPL", type: "Stock", side: "Long", pnl: 250.50 },
+  { id: "1", dateOpen: "2026-06-01", dateClose: "2026-06-02", ticker: "MU", type: "Option", side: "Long", pnl: 57.75 },
   { id: "2", dateOpen: "2026-06-02", dateClose: "2026-06-02", ticker: "TSLA", type: "Option", side: "Short", pnl: -320.00 },
-  { id: "3", dateOpen: "2026-06-03", dateClose: "2026-06-04", ticker: "NVDA", type: "Stock", side: "Long", pnl: 850.00 },
-  { id: "4", dateOpen: "2026-06-04", dateClose: "2026-06-05", ticker: "SPY", type: "Option", side: "Long", pnl: 450.00 },
-  { id: "5", dateOpen: "2026-06-05", dateClose: "2026-06-05", ticker: "AAPL", type: "Stock", side: "Long", pnl: -110.00 },
-  { id: "6", dateOpen: "2026-06-08", dateClose: "2026-06-09", ticker: "ES_F", type: "Future", side: "Short", pnl: 600.00 },
-  { id: "7", dateOpen: "2026-06-10", dateClose: "2026-06-10", ticker: "MSFT", type: "Stock", side: "Long", pnl: 120.00 },
-  { id: "8", dateOpen: "2026-06-11", dateClose: "2026-06-12", ticker: "TSLA", type: "Option", side: "Long", pnl: -200.00 },
-  { id: "9", dateOpen: "2026-06-12", dateClose: "2026-06-15", ticker: "NVDA", type: "Stock", side: "Long", pnl: 340.00 },
-  { id: "10", dateOpen: "2026-06-16", dateClose: "2026-06-17", ticker: "ES_F", type: "Future", side: "Long", pnl: -150.00 }
+  { id: "3", dateOpen: "2026-06-03", dateClose: "2026-06-04", ticker: "MRVL", type: "Option", side: "Long", pnl: 104.68 },
+  { id: "4", dateOpen: "2026-06-04", dateClose: "2026-06-04", ticker: "MSFT", type: "Option", side: "Long", pnl: 61.75 },
+  { id: "5", dateOpen: "2026-06-03", dateClose: "2026-06-04", ticker: "HOOD", type: "Option", side: "Long", pnl: 44.75 }
 ];
 
 // Helper to cleanly parse CSV lines while respecting quotes with commas
@@ -196,7 +191,7 @@ export default function App() {
         const docId = crypto.randomUUID();
         const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'trades', docId);
         await setDoc(docRef, formatted);
-        showToast("Trade saved to your secure cloud account.");
+        showToast("Trade saved to secure cloud account.");
       } catch (err) {
         showToast("Could not save to cloud. Saved in local memory instead.", "error");
         setTrades(prev => [...prev, { id: crypto.randomUUID(), ...formatted }]);
@@ -266,7 +261,7 @@ export default function App() {
           batch.set(docRef, t);
         });
         await batch.commit();
-        showToast(`Successfully imported ${importedList.length} trades to cloud.`);
+        showToast(`Successfully imported ${importedList.length} matched trades.`);
       } catch (err) {
         showToast("Cloud sync failed. Importing to local session.", "error");
         setTrades(prev => [...prev, ...importedList.map(t => ({ ...t, id: crypto.randomUUID() }))]);
@@ -275,7 +270,7 @@ export default function App() {
       }
     } else {
       setTrades(prev => [...prev, ...importedList.map(t => ({ ...t, id: crypto.randomUUID() }))]);
-      showToast(`Imported ${importedList.length} trades to session.`);
+      showToast(`Imported ${importedList.length} matched trades.`);
     }
   };
 
@@ -284,34 +279,42 @@ export default function App() {
     try {
       const headers = parseCSVLine(lines[0]);
       
-      const idxDate = headers.indexOf('Date');
-      const idxType = headers.indexOf('Type');
-      const idxAction = headers.indexOf('Action');
-      const idxSymbol = headers.indexOf('Symbol');
-      const idxUnderlying = headers.indexOf('Underlying Symbol');
-      const idxInstrument = headers.indexOf('Instrument Type');
-      const idxQuantity = headers.indexOf('Quantity');
-      const idxTotal = headers.indexOf('Total');
+      const idxDate = headers.findIndex(h => h.toLowerCase() === 'date');
+      const idxType = headers.findIndex(h => h.toLowerCase() === 'type');
+      const idxAction = headers.findIndex(h => h.toLowerCase() === 'action');
+      const idxSymbol = headers.findIndex(h => h.toLowerCase() === 'symbol');
+      const idxUnderlying = headers.findIndex(h => h.toLowerCase() === 'underlying symbol');
+      const idxInstrument = headers.findIndex(h => h.toLowerCase() === 'instrument type');
+      const idxQuantity = headers.findIndex(h => h.toLowerCase() === 'quantity');
+      const idxTotal = headers.findIndex(h => h.toLowerCase() === 'total');
 
       if (idxDate === -1 || idxAction === -1 || idxSymbol === -1 || idxTotal === -1) {
-        return null; // Fall back to the manual mapper if headers don't match Tastytrade format
+        return null;
       }
 
       const tradeRows = lines.slice(1).map(line => {
         const cells = parseCSVLine(line);
-        if (cells.length < headers.length) return null;
+        if (cells.length <= Math.max(idxDate, idxAction, idxSymbol, idxTotal)) return null;
+        
+        const typeVal = cells[idxType] || '';
+        const actionVal = cells[idxAction] || '';
+        
+        // Support standard trades AND expiration/assignment entries
+        if (typeVal !== 'Trade' && typeVal !== 'Receive Deliver') return null;
+        
         return {
           date: cells[idxDate],
-          type: cells[idxType],
-          action: cells[idxAction],
-          symbol: cells[idxSymbol],
-          underlying: cells[idxUnderlying] || cells[idxSymbol],
+          type: typeVal,
+          action: actionVal,
+          // Normalize whitespace variation inside option strings
+          symbol: (cells[idxSymbol] || '').replace(/\s+/g, ' ').trim(),
+          underlying: (cells[idxUnderlying] || cells[idxSymbol] || '').trim(),
           instrument: cells[idxInstrument] || 'Stock',
           quantity: Math.abs(parseInt(cells[idxQuantity], 10)) || 1,
-          total: parseFloat(cells[idxTotal].replace(/[^0-9.-]/g, '')) || 0
+          total: parseFloat((cells[idxTotal] || '').replace(/[^0-9.-]/g, '')) || 0
         };
       })
-      .filter(r => r && r.type === 'Trade')
+      .filter(Boolean)
       .sort((a, b) => new Date(a.date) - new Date(b.date));
 
       const openPositions = {}; 
@@ -319,8 +322,10 @@ export default function App() {
 
       tradeRows.forEach(row => {
         const symbol = row.symbol;
-        const isOpening = row.action.includes('_OPEN') || row.action === 'BUY' || row.action === 'SELL';
-        const isClosing = row.action.includes('_CLOSE');
+        const action = row.action;
+        
+        const isOpening = action.includes('_OPEN') || action === 'BUY' || action === 'SELL';
+        const isClosing = action.includes('_CLOSE') || action === 'Expiration' || action === 'Assignment' || action === 'Exercise';
 
         if (!openPositions[symbol]) {
           openPositions[symbol] = [];
@@ -331,9 +336,9 @@ export default function App() {
             qtyRemaining: row.quantity,
             totalCost: row.total,
             dateOpen: row.date.split('T')[0],
-            side: row.action.includes('BUY') ? 'Long' : 'Short',
-            ticker: row.underlying,
-            instrument: row.instrument
+            side: action.includes('BUY') ? 'Long' : 'Short',
+            ticker: row.underlying.toUpperCase(),
+            instrument: row.instrument === 'Equity Option' ? 'Option' : row.instrument
           });
         } else if (isClosing) {
           let qtyToClose = row.quantity;
@@ -345,15 +350,13 @@ export default function App() {
 
             const openCostProportional = (firstOpen.totalCost / firstOpen.qtyRemaining) * matchQty;
             const closeCreditProportional = (row.total / row.quantity) * matchQty;
-
-            // Adding directly because debits are negative values and credits are positive values
             const pnl = openCostProportional + closeCreditProportional;
 
             completedClosedTrades.push({
               dateOpen: firstOpen.dateOpen,
               dateClose: row.date.split('T')[0],
-              ticker: firstOpen.ticker.toUpperCase(),
-              type: firstOpen.instrument === 'Equity Option' ? 'Option' : firstOpen.instrument,
+              ticker: firstOpen.ticker,
+              type: firstOpen.instrument,
               side: firstOpen.side,
               pnl: pnl
             });
@@ -366,14 +369,14 @@ export default function App() {
             }
           }
 
-          // Handle orphaned close executions without a corresponding open inside this export window
+          // Handle pre-existing positions closed within this file window
           if (qtyToClose > 0) {
             completedClosedTrades.push({
               dateOpen: row.date.split('T')[0],
               dateClose: row.date.split('T')[0],
-              ticker: row.underlying.toUpperCase(),
+              ticker: row.underlying.toUpperCase() + " (Pre-Open)",
               type: row.instrument === 'Equity Option' ? 'Option' : row.instrument,
-              side: row.action.includes('BUY') ? 'Short' : 'Long',
+              side: action.includes('BUY') ? 'Short' : 'Long',
               pnl: (row.total / row.quantity) * qtyToClose
             });
           }
@@ -382,25 +385,53 @@ export default function App() {
 
       return completedClosedTrades;
     } catch (err) {
-      console.error("Tastytrade processing failure", err);
+      console.error("Tastytrade FIFO handling exception:", err);
       return null;
     }
   };
 
-  // --- CSV Parser & Mapper Logic ---
+  // --- CSV Parser & Text Sanitizer ---
   const startCsvMapping = () => {
     if (!csvText || !csvText.trim()) {
       showToast("Please paste CSV data first.", "error");
       return;
     }
-    const lines = csvText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
-    if (lines.length < 2) {
-      showToast("Not enough CSV data. Verify row format.", "error");
+
+    // Advanced Text Sanitization Layer
+    // 1. Clear system tracking comments/source tags injected by copy-paste or environments
+    let cleanedInput = csvText.replace(/\/gi, '');
+    
+    // 2. Stitch line breaks seamlessly back together
+    let rawLines = cleanedInput.split(/\r?\n/);
+    let sanitizedLines = [];
+    let activeRowBuffer = "";
+
+    for (let line of rawLines) {
+      line = line.trim();
+      if (!line) continue;
+
+      if (!activeRowBuffer) {
+        activeRowBuffer = line;
+      } else {
+        // If line begins with a standard ISO date (e.g. 2026-06-) or is the header row, commit previous
+        if (/^\d{4}-\d{2}-\d{2}/.test(line) || /^date,/i.test(line)) {
+          sanitizedLines.push(activeRowBuffer);
+          activeRowBuffer = line;
+        } else {
+          // Stitch wrapped structural column strings together
+          activeRowBuffer += " " + line;
+        }
+      }
+    }
+    if (activeRowBuffer) sanitizedLines.push(activeRowBuffer);
+
+    if (sanitizedLines.length < 2) {
+      showToast("Malformed content layout. Verify raw data health.", "error");
       return;
     }
 
-    // 1. Run automatic Tastytrade detection engine
-    const fifoMatchedTrades = processTastytradeFIFO(lines);
+    // Run the integrated Tastytrade specific FIFO processor
+    const fifoMatchedTrades = processTastytradeFIFO(sanitizedLines);
     if (fifoMatchedTrades && fifoMatchedTrades.length > 0) {
       handleBulkImport(fifoMatchedTrades);
       setCsvText('');
@@ -408,9 +439,9 @@ export default function App() {
       return;
     }
 
-    // 2. Standard CSV manual fallback mapping layout rules
-    const headers = parseCSVLine(lines[0]);
-    const previewRows = lines.slice(1, 4).map(line => parseCSVLine(line));
+    // Manual Fallback Rule Engine
+    const headers = parseCSVLine(sanitizedLines[0]);
+    const previewRows = sanitizedLines.slice(1, 4).map(line => parseCSVLine(line));
 
     setCsvPreviewHeaders(headers || []);
     setCsvPreviewRows(previewRows || []);
@@ -424,7 +455,7 @@ export default function App() {
       else if (lower.includes('ticker') || lower.includes('symbol')) detected.ticker = String(index);
       else if (lower.includes('type') || lower.includes('asset')) detected.type = String(index);
       else if (lower.includes('side') || lower.includes('action')) detected.side = String(index);
-      else if (lower.includes('pnl') || lower.includes('p/l') || lower.includes('profit') || lower.includes('gain')) detected.pnl = String(index);
+      else if (lower.includes('pnl') || lower.includes('p/l') || lower.includes('profit') || lower.includes('gain') || lower.includes('total')) detected.pnl = String(index);
     });
 
     setMappings(detected);
@@ -438,8 +469,27 @@ export default function App() {
     }
 
     try {
-      const lines = csvText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
-      const rows = lines.slice(1);
+      let cleanedInput = csvText.replace(/\/gi, '');
+      let rawLines = cleanedInput.split(/\r?\n/);
+      let sanitizedLines = [];
+      let activeRowBuffer = "";
+
+      for (let line of rawLines) {
+        line = line.trim();
+        if (!line) continue;
+        if (!activeRowBuffer) { activeRowBuffer = line; } 
+        else {
+          if (/^\d{4}-\d{2}-\d{2}/.test(line) || /^date,/i.test(line)) {
+            sanitizedLines.push(activeRowBuffer);
+            activeRowBuffer = line;
+          } else {
+            activeRowBuffer += " " + line;
+          }
+        }
+      }
+      if (activeRowBuffer) sanitizedLines.push(activeRowBuffer);
+
+      const rows = sanitizedLines.slice(1);
       const parsedTrades = [];
 
       rows.forEach(row => {
@@ -455,13 +505,12 @@ export default function App() {
         const dateOpenVal = mappings.dateOpen ? cells[parseInt(mappings.dateOpen, 10)] : dateCloseVal;
         const typeVal = mappings.type ? cells[parseInt(mappings.type, 10)] : 'Stock';
         const sideVal = mappings.side ? cells[parseInt(mappings.side, 10)] : 'Long';
-
         const cleanedPnl = parseFloat(pnlRaw.replace(/[^0-9.-]/g, '')) || 0;
 
         parsedTrades.push({
           dateOpen: dateOpenVal || dateCloseVal,
-          dateClose: dateCloseVal,
-          ticker: tickerVal.toUpperCase(),
+          dateClose: dateCloseVal.split('T')[0],
+          ticker: tickerVal.split(' ')[0].toUpperCase(),
           type: typeVal || 'Stock',
           side: sideVal || 'Long',
           pnl: cleanedPnl
@@ -473,10 +522,10 @@ export default function App() {
         setIsMappingMode(false);
         setCsvText('');
       } else {
-        showToast("No valid rows could be parsed. Check mapping selections.", "error");
+        showToast("No valid data parsed. Review mapping alignment fields.", "error");
       }
     } catch (err) {
-      showToast("Import parsing failed. Verify CSV structural health.", "error");
+      showToast("Manual processing parser fault structural anomaly.", "error");
     }
   };
 
@@ -599,7 +648,7 @@ export default function App() {
     });
   }, [processedTrades]);
 
-  // --- Views ---
+  // --- Views Layout Modules ---
   const renderDashboard = () => {
     const buildEquityCurve = () => {
       if (!equityCurvePoints || equityCurvePoints.length < 2) {
@@ -678,7 +727,6 @@ export default function App() {
 
     return (
       <div className="space-y-6">
-        {/* KPI Row */}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
           <div className="bg-white p-6 rounded-xl border border-slate-200 shadow-sm flex items-center space-x-4">
             <div className={`p-3 rounded-full ${metrics.totalPnl >= 0 ? 'bg-emerald-100 text-emerald-600' : 'bg-rose-100 text-rose-600'}`}>
@@ -727,7 +775,6 @@ export default function App() {
           </div>
         </div>
 
-        {/* Charts Section */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
           <div className="bg-white lg:col-span-2 rounded-xl border border-slate-200 shadow-sm overflow-hidden flex flex-col justify-between">
             <div className="p-5 border-b border-slate-100 bg-slate-50 flex justify-between items-center">
@@ -766,7 +813,6 @@ export default function App() {
           </div>
         </div>
 
-        {/* Ticker Summary */}
         <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
           <div className="p-5 border-b border-slate-100 bg-slate-50">
             <h2 className="text-sm font-semibold text-slate-800 uppercase tracking-wider flex items-center">
@@ -785,7 +831,7 @@ export default function App() {
               </thead>
               <tbody className="divide-y divide-slate-100">
                 {tickerStats.length === 0 ? (
-                  <tr><td colSpan="4" className="p-4 text-center text-slate-500">No trading records found inside current filters</td></tr>
+                  <tr><td colSpan="4" className="p-4 text-center text-slate-500">No records found within current filter choices</td></tr>
                 ) : tickerStats.map((t) => (
                   <tr key={t.ticker} className="hover:bg-slate-50 transition">
                     <td className="p-4 font-bold text-slate-800">{t.ticker}</td>
@@ -923,7 +969,7 @@ export default function App() {
           </thead>
           <tbody className="divide-y divide-slate-100 text-sm">
             {processedTrades.length === 0 ? (
-              <tr><td colSpan="7" className="p-8 text-center text-slate-500 font-medium">No recorded trades match filters.</td></tr>
+              <tr><td colSpan="7" className="p-8 text-center text-slate-500 font-medium">No recorded trades match active filter structures.</td></tr>
             ) : processedTrades.sort((a,b) => new Date(b.dateClose) - new Date(a.dateClose)).map((t, i) => (
               <tr key={t.id || i} className="hover:bg-slate-50 transition text-sm">
                 <td className="p-4 text-slate-600">{t.dateOpen}</td>
@@ -964,13 +1010,13 @@ export default function App() {
             <h2 className="text-sm font-semibold text-slate-800 uppercase tracking-wider flex items-center mb-1">
               <Upload className="mr-2 h-4 w-4 text-indigo-500" /> Interactive Brokerage Import
             </h2>
-            <p className="text-xs text-slate-500">Paste raw CSV files from your brokerage. The engine auto-detects Tastytrade files and calculates closed trade profits using dynamic FIFO handling.</p>
+            <p className="text-xs text-slate-500">Paste raw CSV files from your brokerage. The engine auto-detects Tastytrade configuration files and calculates closed trade profits via matching engine parameters.</p>
           </div>
           
           <div className="space-y-3">
             <textarea 
               className="w-full h-44 p-4 border border-slate-200 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 text-xs font-mono bg-slate-50/50"
-              placeholder={`Paste your transaction history or closed orders CSV raw text here...`}
+              placeholder={`Paste transaction history layout lines context straight here...`}
               value={csvText}
               onChange={(e) => setCsvText(e.target.value)}
             ></textarea>
@@ -980,7 +1026,7 @@ export default function App() {
                 onClick={startCsvMapping}
                 className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-semibold shadow-sm transition"
               >
-                Process File & Map Logs
+                Process File & Track Trades
               </button>
               
               <button 
@@ -1250,7 +1296,7 @@ export default function App() {
         </div>
       </aside>
 
-      {/* Main Body View Layout Router */}
+      {/* Main Body View Layout */}
       <main className="flex-1 p-6 lg:p-8 overflow-y-auto max-h-screen">
         <header className="mb-6 bg-white p-5 rounded-2xl border border-slate-200 shadow-sm flex flex-col lg:flex-row justify-between lg:items-center gap-4">
           <div className="space-y-1">
